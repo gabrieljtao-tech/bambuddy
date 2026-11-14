@@ -7,7 +7,7 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 
 # Use cache mount for npm
-RUN --mount=type=cache,target=/root/.npm \
+RUN \
     npm ci
 
 COPY frontend/ ./
@@ -54,7 +54,7 @@ RUN setcap cap_net_bind_service=+ep "$(readlink -f /usr/local/bin/python3)"
 # wheels (so a hostile wheel could hijack stdlib imports during install).
 # requirements.lock pins the exact versions that were tested (see CONTRIBUTING.md).
 COPY requirements.txt requirements.lock ./
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN \
     pip install --root-user-action=ignore --upgrade 'pip>=26.1.2' \
  && pip install --root-user-action=ignore -r requirements.lock
 
@@ -68,10 +68,19 @@ COPY backend/ ./backend/
 # Without this, the production image has no git metadata at all and would
 # always pull `main` on the remote device regardless of which branch
 # Bambuddy itself was built from.
-COPY .git/HEAD ./.git/HEAD
+RUN mkdir -p ./.git && printf 'ref: refs/heads/main\n' > ./.git/HEAD
 
 # Copy built frontend from builder stage
 COPY --from=frontend-builder /app/static ./static
+
+# Normalise read access on the application trees. The entrypoint only
+# chowns /app/data and /app/logs before dropping to PUID:PGID via gosu,
+# so any backend/static file that lands in the image without world-read
+# (e.g. an upload-based build context with restrictive perms) crash-loops
+# the app at import with PermissionError. a+rX is the least privilege
+# that fixes the class: readable files, traversable directories, no
+# write granted. (Railway crash 2026-11-12, Interface fix 2026-11-13.)
+RUN chmod -R a+rX /app/backend /app/static
 
 # Create data directories. Ownership is normalised at startup by the
 # entrypoint (chowns to PUID:PGID and drops privileges via gosu before
@@ -96,6 +105,15 @@ RUN mkdir -p /app/data /app/logs && \
 # privilege drop. See deploy/docker-entrypoint.sh for the full rationale.
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Cloud bridge (Interface, 2026-11-14): Railway containers have no
+# /dev/net/tun, so the tailnet leg runs as userspace tailscaled inside
+# the container + per-printer loopback forwarders through its SOCKS5
+# proxy. bridge-entrypoint.sh starts both, then execs the stock
+# entrypoint with the original CMD, unchanged.
+COPY deploy/bridge-entrypoint.sh /usr/local/bin/bridge-entrypoint.sh
+COPY deploy/loopback_forwarder.py /usr/local/bin/loopback_forwarder.py
+RUN chmod +x /usr/local/bin/bridge-entrypoint.sh
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
@@ -156,5 +174,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 # past Docker's 10s grace and back into SIGKILL. On timeout uvicorn cancels the
 # request tasks; the camera generators already unwind cleanly on CancelledError.
 ENV UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=5
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/bridge-entrypoint.sh"]
 CMD ["sh", "-c", "exec uvicorn backend.app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --loop asyncio --timeout-graceful-shutdown ${UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN}"]
